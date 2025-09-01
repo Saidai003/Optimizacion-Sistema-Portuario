@@ -34,6 +34,16 @@ for col in [COL_ETA, COL_ETD, COL_SWK, COL_EWK]:
         df[col] = pd.to_datetime(df[col], errors="coerce")
 
 # Tiempo de referencia: mínimo entre ETA y SWK
+# si no tienes ETA ni SWK, usa la fecha 2000-01-01
+# Definiciones
+# ETA: Estimated Time of Arrival
+# ETD: Estimated Time of Departure
+# SWK: Start of Work
+# EWK: End of Work
+
+# La variable c de if c in df.columns es cada una de las columnas de tiempo 
+# de entrada definidas arriba (ETA, SWK) en el excel.
+
 time_candidates = []
 for c in [COL_ETA, COL_SWK]:
     if c in df.columns:
