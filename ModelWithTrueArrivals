@@ -44,6 +44,9 @@ for col in [COL_ETA, COL_ETD, COL_SWK, COL_EWK]:
 # La variable c de if c in df.columns es cada una de las columnas de tiempo 
 # de entrada definidas arriba (ETA, SWK) en el excel.
 
+# Este codigo busca la fecha minima entre ETA y SWK para usarla como referencia.
+# Si no hay ninguna de las dos, usa una fecha fija (2000-01-01).
+
 time_candidates = []
 for c in [COL_ETA, COL_SWK]:
     if c in df.columns:
@@ -62,6 +65,10 @@ ships  = sorted(df[SHIP_COL].dropna().unique().tolist())
 berths = sorted(df[BERTH_COL].dropna().unique().tolist())
 
 # Compatibilidad histórica
+# Este bloque de codigo crea un diccionario llamado 'comp' que indica si un buque ha sido
+# asignado a un sitio en los datos históricos. Si un buque i ha sido asignado al sitio b, entonces
+# comp[(i, b)] = 1, de lo contrario comp[(i, b)] = 0.
+# Esto se usa para restringir las asignaciones en el modelo a solo sitios con historial de compatibilidad.
 comp = {(i, b): 0 for i in ships for b in berths}
 for _, r in df.iterrows():
     si, bi = r.get(SHIP_COL), r.get(BERTH_COL)
