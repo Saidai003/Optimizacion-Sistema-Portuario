@@ -1,0 +1,343 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import gurobipy as gp
+from gurobipy import GRB
+
+# ========================
+# Configuración de entrada
+# ========================
+EXCEL_FILE = "resultados_berthings_SAI.xlsx"
+
+SHIP_COL  = "v_name" # columna con identificador único de buque
+BERTH_COL = "vb_pos_name" # columna con identificador único de sitio
+COL_ETA   = "vb_eta" # columna con ETA (datetime)
+COL_ETD   = "vb_etd" # columna con ETD (datetime)
+COL_SWK   = "vb_start_work" # columna con inicio de servicio (datetime)
+COL_EWK   = "vb_stop_work" # columna con fin de servicio (datetime)
+
+# Reglas operativas
+SETUP_HOURS   = 1.0   # tiempo entre buques en el mismo sitio (posiblemente variable por sitio)
+DELTA_HOURS   = 0.0   # si quieres separación global de maniobras, puedes usar 1.0; aquí lo dejamos en 0 y confiamos en SETUP por sitio
+GAMMA_PREEMPT = 6.0   # penalización por activar preempción (equivalente en horas de espera). Indica que tan dispuesto esta el modelo a usar preempción
+TIME_BUFFER   = 72.0  # margen extra de horizonte
+CLOSURES      = []    # [(inicio_h, fin_h), ...] relativos a ref_time; déjalo vacío si no tienes cierres
+
+# ========================
+# 1) Lectura y limpieza
+# ========================
+df = pd.read_excel(EXCEL_FILE)
+df.columns = df.columns.str.strip()
+
+for col in [COL_ETA, COL_ETD, COL_SWK, COL_EWK]:
+    if col in df.columns:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+
+# Tiempo de referencia: mínimo entre ETA y SWK
+time_candidates = []
+for c in [COL_ETA, COL_SWK]:
+    if c in df.columns:
+        time_candidates.append(df[c])
+ref_time = (pd.concat(time_candidates).min()
+            if time_candidates and not pd.concat(time_candidates).dropna().empty
+            else pd.Timestamp("2000-01-01 00:00:00"))
+
+# Horas relativas al ref_time
+df["ETA_h"]     = (df[COL_ETA] - ref_time).dt.total_seconds() / 3600
+df["ETD_h"]     = (df[COL_ETD] - ref_time).dt.total_seconds() / 3600
+df["service_h"] = (df[COL_EWK] - df[COL_SWK]).dt.total_seconds() / 3600
+
+# Conjuntos
+ships  = sorted(df[SHIP_COL].dropna().unique().tolist())
+berths = sorted(df[BERTH_COL].dropna().unique().tolist())
+
+# Compatibilidad histórica
+comp = {(i, b): 0 for i in ships for b in berths}
+for _, r in df.iterrows():
+    si, bi = r.get(SHIP_COL), r.get(BERTH_COL)
+    if pd.notna(si) and pd.notna(bi):
+        comp[(si, bi)] = 1
+
+# earliest / latest / due con fallback seguro
+earliest_series = df.groupby(SHIP_COL)["ETA_h"].min()
+latest_series   = df.groupby(SHIP_COL)["ETA_h"].max()
+due_series      = df.groupby(SHIP_COL)["ETD_h"].max()
+
+min_eta_global = earliest_series.min()
+fallback_eta   = float(min_eta_global if not pd.isna(min_eta_global) else 0.0)
+
+earliest, latest, due = {}, {}, {}
+missing_eta, missing_lat, missing_due = [], [], []
+
+for s in ships:
+    ve = earliest_series.get(s, np.nan)
+    if pd.isna(ve):
+        ve = fallback_eta
+        missing_eta.append(s)
+    earliest[s] = float(ve)
+
+    vl = latest_series.get(s, np.nan)
+    if pd.isna(vl):
+        vl = earliest[s]
+        missing_lat.append(s)
+    latest[s] = float(vl)
+
+    vd = due_series.get(s, np.nan)
+    if pd.isna(vd):
+        vd = latest[s] + 72.0
+        missing_due.append(s)
+    due[s] = float(vd)
+
+if missing_eta:
+    print(f"[Aviso] Buques sin ETA encontrada, usando fallback: {missing_eta}")
+if missing_lat:
+    print(f"[Aviso] Buques sin latest encontrada, usando earliest como latest: {missing_lat}")
+if missing_due:
+    print(f"[Aviso] Buques sin due encontrada, usando latest+72h: {missing_due}")
+
+# Tiempos de servicio por (buque, sitio) con fallback
+service_pairs = df.groupby([SHIP_COL, BERTH_COL])["service_h"].median()
+overall_service_default = float(df["service_h"].median()) if not df["service_h"].dropna().empty else 12.0
+service_by_berth = df.groupby(BERTH_COL)["service_h"].median().to_dict()
+
+service = {}
+for i in ships:
+    for b in berths:
+        if comp[(i, b)] == 1:
+            val = service_pairs.get((i, b), np.nan)
+            if not pd.isna(val) and val > 0:
+                service[(i, b)] = float(val)
+            else:
+                vb = service_by_berth.get(b, np.nan)
+                service[(i, b)] = float(vb) if not pd.isna(vb) and vb > 0 else overall_service_default
+        else:
+            service[(i, b)] = overall_service_default  # dummy (x=0 lo anula)
+
+# Filtrar buques sin ningún sitio compatible
+feasible_ships = [i for i in ships if any(comp[(i, b)] == 1 for b in berths)]
+excluded = sorted(set(ships) - set(feasible_ships))
+if excluded:
+    print(f"[Aviso] Buques sin compatibilidad con ningún sitio (excluidos): {excluded}")
+ships = feasible_ships
+
+if not ships:
+    raise ValueError("No quedan buques factibles tras filtrar compatibilidad.")
+
+# Pesos de prioridad (si no tienes datos, 1.0)
+prio = {i: 1.0 for i in ships}
+
+# Horizonte y Big-M
+T0 = min(earliest[i] for i in ships)
+T1_candidates = []
+for i in ships:
+    # due y/o ETA + service + buffer
+    T1_candidates.append(due[i])
+    max_srv = max(service[(i, b)] for b in berths if comp[(i, b)] == 1)
+    T1_candidates.append(earliest[i] + max_srv + TIME_BUFFER)
+T1 = max(T1_candidates) if T1_candidates else (T0 + 7 * 24)
+
+M = (T1 - T0) + TIME_BUFFER
+
+# ========================
+# 2) Modelo con preempción (compacto)
+# ========================
+m = gp.Model("BAP_preempt_compact")
+segs = [0, 1]  # hasta 1 preempción
+
+# Variables
+x = m.addVars(ships, berths, vtype=GRB.BINARY, name="x")         # asignación a sitio
+d = m.addVars(ships, segs, lb=0.0, name="dur")                   # duración segmento
+s = m.addVars(ships, segs, lb=T0, ub=T1, name="start")           # inicio segmento
+c = m.addVars(ships, segs, lb=T0, ub=T1, name="comp")            # término segmento
+u = m.addVars(ships, vtype=GRB.BINARY, name="preempt")           # indicador preempción
+
+# Filtro de pares “posiblemente conflictivos”
+def overlap_possible(i, j):
+    # Heurística: si la diferencia de ETAs es menor que suma de servicios típicos + pequeño buffer
+    max_srv_i = max(service[(i, b)] for b in berths if comp[(i, b)] == 1)
+    max_srv_j = max(service[(j, b)] for b in berths if comp[(j, b)] == 1)
+    return abs(earliest[i] - earliest[j]) < (max_srv_i + max_srv_j + 4.0)
+
+# Precedencias por sitio solo para pares candidatos
+y = {}
+for b in berths:
+    cand = [i for i in ships if comp[(i, b)] == 1]
+    for idx, i in enumerate(cand):
+        for j in cand[idx + 1:]:
+            if overlap_possible(i, j):
+                for ki in segs:
+                    for kj in segs:
+                        y[(i, j, b, ki, kj)] = m.addVar(vtype=GRB.BINARY, name=f"y_{i}_{j}_{b}_{ki}_{kj}")
+
+m.update()
+
+# ========================
+# 3) Restricciones
+# ========================
+
+# (R1) Asignación única (a sitios compatibles)
+for i in ships:
+    m.addConstr(gp.quicksum(x[i, b] for b in berths if comp[(i, b)] == 1) == 1, name=f"assign_{i}")
+    for b in berths:
+        if comp[(i, b)] == 0:
+            m.addConstr(x[i, b] == 0, name=f"incomp_{i}_{b}")
+
+# (R2) Término por segmento
+for i in ships:
+    for ki in segs:
+        m.addConstr(c[i, ki] == s[i, ki] + d[i, ki], name=f"def_c_{i}_{ki}")
+
+# (R3) Suma de duraciones = servicio del sitio asignado
+for i in ships:
+    m.addConstr(d[i, 0] + d[i, 1] == gp.quicksum(service[(i, b)] * x[i, b] for b in berths), name=f"total_dur_{i}")
+
+# (R4) Encadenamiento y activación de preempción
+EPS = 1e-3
+for i in ships:
+    m.addConstr(d[i, 0] >= EPS, name=f"d0_pos_{i}")
+    m.addConstr(d[i, 1] <= M * u[i], name=f"d1_if_u_{i}")
+    m.addConstr(s[i, 1] >= c[i, 0] - M * (1 - u[i]), name=f"chain_{i}")
+
+# (R5) Ventanas de llegada sobre primer segmento
+for i in ships:
+    m.addConstr(s[i, 0] >= earliest[i], name=f"eta_{i}")
+    # si quieres acotar el último inicio:
+    # m.addConstr(s[i, 0] <= latest[i] + TIME_BUFFER, name=f"latest_{i}")
+
+# (R6) No solapamiento por sitio (segmento a segmento) para pares filtrados
+for (i, j, b, ki, kj), yij in y.items():
+    # j,kj después de i,ki si yij=1 y ambos están en b
+    m.addConstr(
+        s[j, kj] >= c[i, ki] + SETUP_HOURS
+        - M * (1 - yij)
+        - M * (2 - x[i, b] - x[j, b]),
+        name=f"noovl_ij_{i}_{j}_{b}_{ki}_{kj}"
+    )
+    # i,ki después de j,kj si yij=0 y ambos están en b
+    m.addConstr(
+        s[i, ki] >= c[j, kj] + SETUP_HOURS
+        - M * (yij)
+        - M * (2 - x[i, b] - x[j, b]),
+        name=f"noovl_ji_{i}_{j}_{b}_{ki}_{kj}"
+    )
+
+# (R7) Cierres de puerto (opcional): cada segmento termina antes o empieza después de cada cierre
+for k, (a, bend) in enumerate(CLOSURES):
+    for i in ships:
+        for ki in segs:
+            w = m.addVar(vtype=GRB.BINARY, name=f"wclose_{i}_{ki}_{k}")
+            m.addConstr(c[i, ki] <= a + M * w,           name=f"close_before_{i}_{ki}_{k}")
+            m.addConstr(s[i, ki] >= bend - M * (1 - w),  name=f"close_after_{i}_{ki}_{k}")
+
+# (R8) Separación global de maniobras (si la quieres activa)
+if DELTA_HOURS > 0:
+    qstart, qend = {}, {}
+    for idx_i, i in enumerate(ships):
+        for j in ships[idx_i + 1:]:
+            for ki in segs:
+                for kj in segs:
+                    qstart[(i, j, ki, kj)] = m.addVar(vtype=GRB.BINARY, name=f"qstart_{i}_{j}_{ki}_{kj}")
+                    qend[(i, j, ki, kj)]   = m.addVar(vtype=GRB.BINARY, name=f"qend_{i}_{j}_{ki}_{kj}")
+    m.update()
+    for idx_i, i in enumerate(ships):
+        for j in ships[idx_i + 1:]:
+            for ki in segs:
+                for kj in segs:
+                    qs = qstart[(i, j, ki, kj)]
+                    qe = qend[(i, j, ki, kj)]
+                    m.addConstr(s[j, kj] >= s[i, ki] + DELTA_HOURS - M * (1 - qs), name=f"sep_s_ij_{i}_{j}_{ki}_{kj}")
+                    m.addConstr(s[i, ki] >= s[j, kj] + DELTA_HOURS - M * qs,       name=f"sep_s_ji_{i}_{j}_{ki}_{kj}")
+                    m.addConstr(c[j, kj] >= c[i, ki] + DELTA_HOURS - M * (1 - qe), name=f"sep_c_ij_{i}_{j}_{ki}_{kj}")
+                    m.addConstr(c[i, ki] >= c[j, kj] + DELTA_HOURS - M * qe,       name=f"sep_c_ji_{i}_{j}_{ki}_{kj}")
+
+# ========================
+# 4) Objetivo
+# ========================
+obj = gp.quicksum(prio[i] * (s[i, 0] - earliest[i]) for i in ships) \
+    + GAMMA_PREEMPT * gp.quicksum(u[i] for i in ships)
+m.setObjective(obj, GRB.MINIMIZE)
+
+m.Params.TimeLimit = 300
+m.Params.MIPGap    = 1e-4
+m.Params.OutputFlag = 1
+
+# ========================
+# 5) Optimizar y reporte
+# ========================
+m.optimize()
+
+# === Resumen compacto de optimización ===
+status_map = {
+    GRB.OPTIMAL: "ÓPTIMO",
+    GRB.TIME_LIMIT: "Límite de tiempo",
+    GRB.INTERRUPTED: "Interrumpido",
+    GRB.INFEASIBLE: "Infactible",
+    GRB.INF_OR_UNBD: "Infactible o no acotado",
+    GRB.UNBOUNDED: "No acotado"
+}
+st = status_map.get(m.status, str(m.status))
+obj = getattr(m, "objVal", float("nan"))
+bound = getattr(m, "objBound", float("nan"))
+gap = getattr(m, "MIPGap", float("nan"))
+
+# KPIs operativos básicos
+total_wait = sum(s[i,0].X - earliest[i] for i in ships)
+avg_wait = total_wait / len(ships) if ships else 0.0
+max_wait = max((s[i,0].X - earliest[i]) for i in ships) if ships else 0.0
+n_preempt = sum(1 for i in ships if u[i].X > 0.5)
+
+print("\n=== RESUMEN DE OPTIMIZACIÓN ===")
+print(f"Estado: {st}")
+print(f"Objetivo alcanzado: {obj:.2f}")
+print(f"Mejor cota: {bound:.2f}")
+print(f"Gap: {gap:.2%}")
+print(f"Buques planificados: {len(ships)}")
+print(f"Espera promedio: {avg_wait:.2f} h | máxima: {max_wait:.2f} h")
+print(f"Preempciones usadas: {n_preempt}")
+
+"""
+// Estos prints muestran los planes por segmentos y resumen por buque
+// Si solo quieres el resumen compacto, comenta todo este bloque
+
+if m.status not in (GRB.OPTIMAL, GRB.TIME_LIMIT):
+    print(f"Modelo terminó con estado: {m.status}")
+else:
+    # Construir plan por segmentos
+    plan = []
+    for i in ships:
+        assigned = [b for b in berths if x[i, b].X > 0.5]
+        berth_i = assigned[0] if assigned else None
+        wait0 = s[i, 0].X - earliest[i]
+        for ki in segs:
+            if d[i, ki].X > 1e-6:
+                plan.append({
+                    "ship": i,
+                    "berth": berth_i,
+                    "seg": ki,
+                    "start": s[i, ki].X,
+                    "dur": d[i, ki].X,
+                    "end": c[i, ki].X,
+                    "wait0": wait0
+                })
+
+    plan_sorted = sorted(plan, key=lambda r: (r["start"], r["ship"], r["seg"]))
+
+    print("\n=== Plan de atraques con preempción (hasta 1 corte) ===")
+    seen = set()
+    for r in plan_sorted:
+        i = r["ship"]
+        if i not in seen:
+            seen.add(i)
+            print(f"\nBuque: {i} | Sitio: {r['berth']} | Espera inicial: {r['wait0']:.2f} h")
+        print(f"  Seg{r['seg']}: start={r['start']:.2f} h  dur={r['dur']:.2f} h  end={r['end']:.2f} h")
+
+    print("\n=== Resumen por buque ===")
+    for i in ships:
+        b = [bb for bb in berths if x[i, bb].X > 0.5]
+        b = b[0] if b else None
+        print(f"- {i} -> {b} | preempt={int(u[i].X+1e-6)} | "
+              f"Seg0: ({s[i,0].X:.2f},{c[i,0].X:.2f}) dur={d[i,0].X:.2f} | "
+              f"Seg1: ({s[i,1].X:.2f},{c[i,1].X:.2f}) dur={d[i,1].X:.2f} | "
+              f"Wait0={s[i,0].X - earliest[i]:.2f} h")
+        
+"""
